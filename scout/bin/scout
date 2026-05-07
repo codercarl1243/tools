@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# scout — Project Knowledge Base Builder
+# Orchestrates repomix → Ollama → kb index into a single guided pipeline
+
+set -euo pipefail
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCOUT_DIR="$(dirname "$SCRIPT_DIR")"
+TOOLS_DIR="$(dirname "$SCOUT_DIR")"
+
+KB_DIR="$TOOLS_DIR/kb"
+REPOMIX_JS="$TOOLS_DIR/repomix/run.js"
+COMPILE_PY="$SCOUT_DIR/compile.py"
+
+PYTHON="python3"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+RESET=$'\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+print_header() {
+  echo ""
+  echo "${CYAN}${BOLD}╔════════════════════════════════════════╗${RESET}"
+  echo "${CYAN}${BOLD}║              scout                     ║${RESET}"
+  echo "${CYAN}${BOLD}║   Project Knowledge Base Builder       ║${RESET}"
+  echo "${CYAN}${BOLD}╚════════════════════════════════════════╝${RESET}"
+  echo ""
+}
+
+print_step() {
+  local num="$1"
+  local total="$2"
+  local title="$3"
+
+  echo ""
+  echo "${BOLD}${CYAN}── Step $num/$total: $title ${RESET}"
+  echo "${DIM}────────────────────────────────────────${RESET}"
+}
+
+print_success() {
+  echo ""
+  echo "${GREEN}${BOLD}✓ $1${RESET}"
+}
+
+print_info() {
+  echo "${DIM}  $1${RESET}"
+}
+
+fail() {
+  echo ""
+  echo "${RED}${BOLD}Error:${RESET} $1"
+  echo ""
+  exit 1
+}
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || {
+    fail "Missing dependency: $1"
+  }
+}
+
+ask_proceed() {
+  local prompt="${1:-Proceed?}"
+
+  echo ""
+  printf "${YELLOW}${BOLD}  $prompt [Y/n] ${RESET}"
+
+  read -r answer
+  answer="${answer:-y}"
+
+  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "${DIM}  Stopped. Completed steps are preserved.${RESET}"
+    echo ""
+    exit 0
+  fi
+
+  echo ""
+}
+
+pick_model() {
+  local default_model="$1"
+  local selected="$default_model"
+
+  local models_json
+
+  models_json=$(curl --max-time 3 -sf http://localhost:11434/api/tags 2>/dev/null || echo "")
+
+  local model_list=()
+
+  model_list=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && model_list+=("$line")
+  done < <(echo "$models_json" | $PYTHON -c "
+import json, sys
+
+try:
+    data = json.load(sys.stdin)
+
+    for m in data.get('models', []):
+        print(m['name'])
+
+except Exception:
+    pass
+" 2>/dev/null)
+
+  if [[ ${#model_list[@]} -eq 0 ]]; then
+    echo "  Using default model: $default_model" >&2
+    echo "$default_model"
+    return
+  fi
+
+  echo "  Select a model for compilation:" >&2
+
+  for i in $(seq 1 "${#model_list[@]}"); do
+    local name="${model_list[$((i - 1))]}"
+
+    if [[ "$name" == "$default_model" ]]; then
+      echo "    $i) $name (default)" >&2
+    else
+      echo "    $i) $name" >&2
+    fi
+  done
+
+  printf "  Choose [1-%d] or Enter for default: " "${#model_list[@]}" >&2
+
+  read -r choice
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#model_list[@]} )); then
+    selected="${model_list[$((choice - 1))]}"
+  fi
+
+  echo "$selected"
+}
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+
+if [[ $# -eq 0 ]]; then
+  echo "${RED}Usage: scout <project-path> [--model <ollama-model>]${RESET}"
+  echo ""
+  echo "  scout ~/projects/my-tauri-app"
+  echo "  scout ~/projects/my-tauri-app --model qwen2.5-coder:14b"
+  echo ""
+  exit 1
+fi
+
+if [[ ! -d "$1" ]]; then
+  fail "Project path does not exist: $1"
+fi
+
+PROJECT_PATH="$(cd "$1" 2>/dev/null && pwd -P)"
+PROJECT_NAME="$(basename "$PROJECT_PATH")"
+
+MODEL="qwen2.5-coder:14b"
+
+shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      if [[ -z "${2:-}" ]]; then
+        fail "--model requires a value"
+      fi
+
+      MODEL="$2"
+      shift 2
+      ;;
+
+    *)
+      fail "Unknown option: $1"
+      ;;
+  esac
+done
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# NOTE:
+# Keeping this outside the repo avoids:
+# - git pollution
+# - giant XML files in projects
+# - stale generated artifacts
+
+OUTPUT_DIR="$HOME/.scout/projects/$PROJECT_NAME"
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+
+require node
+require curl
+require "$PYTHON"
+
+[[ -f "$REPOMIX_JS" ]] || fail "Missing repomix runner: $REPOMIX_JS"
+[[ -f "$COMPILE_PY" ]] || fail "Missing compiler: $COMPILE_PY"
+[[ -f "$KB_DIR/main.py" ]] || fail "Missing kb tool: $KB_DIR/main.py"
+
+if ! curl --max-time 3 -sf http://localhost:11434/api/tags >/dev/null; then
+  echo ""
+  echo "${YELLOW}Warning:${RESET} Ollama is not reachable at http://localhost:11434"
+  echo "${DIM}  Start Ollama before running compilation.${RESET}"
+  echo ""
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+# ── Introduction ──────────────────────────────────────────────────────────────
+
+print_header
+
+echo "${BOLD}Project:${RESET}  $PROJECT_NAME"
+echo "${BOLD}Path:${RESET}     $PROJECT_PATH"
+echo "${BOLD}Output:${RESET}   $OUTPUT_DIR"
+echo "${BOLD}Default Model:${RESET}    $MODEL"
+echo ""
+
+echo "Scout builds a reusable local knowledge base for your project:"
+echo ""
+
+echo "  ${BOLD}1. Structural Dump${RESET} (repomix)"
+echo "     Produces a structured XML snapshot of your source tree."
+echo ""
+
+echo "  ${BOLD}2. Knowledge Compilation${RESET} (Ollama)"
+echo "     Generates:"
+echo "       • architecture.md     — high-level project overview"
+echo "       • dependencies.json  — AI-generated module relationship map"
+echo ""
+
+echo "  ${BOLD}3. Vector Index${RESET} (kb)"
+echo "     Splits source files into semantic chunks,"
+echo "     embeds them locally, and stores them in ChromaDB"
+echo "     for semantic code search."
+echo ""
+
+echo "${DIM}  Nothing leaves your machine.${RESET}"
+echo "${DIM}  No API keys required.${RESET}"
+echo ""
+
+ask_proceed "Ready to start?"
+
+# ── Step 1: repomix ───────────────────────────────────────────────────────────
+
+print_step 1 3 "Structural Dump (repomix)"
+
+echo ""
+echo "${DIM}  Running repomix on $PROJECT_PATH ...${RESET}"
+echo ""
+
+REPOMIX_OUT="$OUTPUT_DIR/_repomix_raw.xml"
+
+node "$REPOMIX_JS" \
+  --output "$REPOMIX_OUT" \
+  --style xml \
+  --output-show-line-numbers \
+  "$PROJECT_PATH"
+
+FILE_COUNT=$(grep -c '<file path=' "$REPOMIX_OUT" 2>/dev/null || echo "?")
+DUMP_SIZE=$(python3 -c "
+import os, sys
+
+size = os.path.getsize(sys.argv[1])
+
+for unit in ('B', 'KB', 'MB', 'GB'):
+    if size < 1024:
+        break
+    size /= 1024.0
+
+print(f'{size:.1f} {unit}')
+" "$REPOMIX_OUT")
+
+print_success "Structural dump complete"
+
+echo ""
+print_info "Files captured:  $FILE_COUNT"
+print_info "Dump size:       $DUMP_SIZE"
+print_info "Saved to:        $REPOMIX_OUT"
+
+echo ""
+echo "${DIM}  Next: Ollama will generate architecture summaries and"
+echo "  approximate module relationships from the structural dump.${RESET}"
+
+ask_proceed "Run Knowledge Compilation?"
+
+# ── Model Picker ──────────────────────────────────────────────────────────────
+
+MODEL=$(pick_model "$MODEL")
+
+echo ""
+
+# ── Step 2: Ollama compilation ────────────────────────────────────────────────
+
+print_step 2 3 "Knowledge Compilation (Ollama)"
+
+echo ""
+echo "${DIM}  Model:   $MODEL${RESET}"
+echo "${DIM}  Reading: $REPOMIX_OUT${RESET}"
+echo ""
+
+"$PYTHON" "$COMPILE_PY" \
+  --repomix "$REPOMIX_OUT" \
+  --output-dir "$OUTPUT_DIR" \
+  --model "$MODEL" \
+  --project-name "$PROJECT_NAME"
+
+ARCH_LINES=$(wc -l < "$OUTPUT_DIR/architecture.md" | grep -o '[0-9]*')
+
+DEP_NODES=$("$PYTHON" -c "
+import json
+
+try:
+    data = json.load(open('$OUTPUT_DIR/dependencies.json'))
+
+    nodes = len(data.get('nodes', []))
+    edges = len(data.get('edges', []))
+
+    print(f'{nodes} nodes, {edges} edges')
+
+except Exception:
+    print('see file')
+" 2>/dev/null)
+
+print_success "Knowledge compilation complete"
+
+echo ""
+print_info "architecture.md:    $ARCH_LINES lines"
+print_info "dependencies.json:  $DEP_NODES"
+print_info "Saved to:           $OUTPUT_DIR"
+
+echo ""
+echo "${DIM}  Next: kb will build a semantic vector index for"
+echo "  natural language search over your codebase.${RESET}"
+
+ask_proceed "Run Vector Index?"
+
+# ── Step 3: kb index ──────────────────────────────────────────────────────────
+
+print_step 3 3 "Vector Index (kb)"
+
+echo ""
+echo "${DIM}  Indexing: $PROJECT_PATH${RESET}"
+echo ""
+
+"$PYTHON" "$KB_DIR/main.py" index "$PROJECT_PATH"
+
+print_success "Vector index complete"
+
+echo ""
+print_info "Index saved to: $OUTPUT_DIR/vector_index/"
+echo ""
+
+# ── Optional Cleanup ──────────────────────────────────────────────────────────
+
+echo ""
+printf "${YELLOW}${BOLD}  Remove raw repomix XML dump? [y/N] ${RESET}"
+
+read -r cleanup_answer
+cleanup_answer="${cleanup_answer:-n}"
+
+if [[ "$cleanup_answer" =~ ^[Yy]$ ]]; then
+  rm -f "$REPOMIX_OUT"
+
+  echo ""
+  print_info "Removed temporary XML dump"
+  echo ""
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+echo "${GREEN}${BOLD}╔════════════════════════════════════════╗${RESET}"
+echo "${GREEN}${BOLD}║        Knowledge base ready ✓          ║${RESET}"
+echo "${GREEN}${BOLD}╚════════════════════════════════════════╝${RESET}"
+
+echo ""
+echo "  ${BOLD}$OUTPUT_DIR/${RESET}"
+echo ""
+
+echo "  architecture.md      — project overview"
+echo "  dependencies.json    — AI-generated module relationships"
+echo "  vector_index/        — semantic embeddings index"
+
+echo ""
+echo "  ${BOLD}Query your codebase:${RESET}"
+echo "  ${CYAN}kb query $PROJECT_NAME \"how do tauri commands connect to the frontend\"${RESET}"
+
+echo ""
+echo "  ${BOLD}Rebuild later:${RESET}"
+echo "  ${CYAN}scout $PROJECT_PATH${RESET}"
+
+echo ""
+echo "${DIM}  Recommended:${RESET} add ~/.scout/ to backups but not git."
+echo ""
