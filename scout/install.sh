@@ -33,6 +33,10 @@ else
 fi
 
 # PATH check
+# Source the shell config so we pick up its PATH (e.g., running `bash install.sh`
+# when the PATH export lives in .zshrc)
+source "$SHELL_RC" 2>/dev/null || true
+
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
   echo ""
   echo "${YELLOW}⚠ $INSTALL_DIR is not in your PATH.${RESET}"
