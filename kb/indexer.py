@@ -1,42 +1,20 @@
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+"""Index a project into a local ChromaDB vector store.
+
+Supports incremental re-indexing: chunk IDs are content-hash based
+(see chunker.chunk_id), so only genuinely new or changed chunks are
+re-embedded on subsequent runs.
+"""
 
 import math
+import os
 import chromadb
-from sentence_transformers import SentenceTransformer
+
 from utils import load_files
-from chunker import chunk_file
-
-# ── Colours ────
-BOLD = "\033[1m"
-DIM = "\033[2m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RESET = "\033[0m"
+from chunker import chunk_file, chunk_id
+from db import get_model, _get_client, BOLD, DIM, GREEN, YELLOW, RESET
 
 
-# Load once — shared by anything that imports this module
-_model = None
-
-def get_model() -> SentenceTransformer:
-    """Return a shared SentenceTransformer instance (lazy-loaded).
-
-    NOTE: Not thread-safe — no locking around _model assignment.
-    Fine for single-threaded CLI use. Add threading.Lock if
-    indexer.py is ever called from multiple threads.
-    """
-    global _model
-    if _model is None:
-        _model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    return _model
-
-
-def _get_client(project_name: str) -> chromadb.PersistentClient:
-    persist_path = os.path.join(os.path.dirname(__file__), "data", project_name)
-    os.makedirs(persist_path, exist_ok=True)
-    return chromadb.PersistentClient(path=persist_path)
-
+# ── Progress bar ──
 
 def _simple_bar(label: str, current: int, total: int, done: bool = False, width: int = 30):
     """Minimal terminal progress bar — no dependencies beyond print."""
@@ -48,6 +26,20 @@ def _simple_bar(label: str, current: int, total: int, done: bool = False, width:
     print(f"\r  {label}  {bar} {pct}  ({current}/{total})  {flag}", flush=True, end="")
     if done:
         print()
+
+
+def _chunk_hash(text: str) -> str:
+    """Full 32-char hex hash for metadata. Chunk IDs are already 16-char hashes."""
+    import hashlib
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _chunk_metadata(c: dict) -> dict:
+    """Build ChromaDB metadata dict for a chunk."""
+    return {
+        "path": c["path"],
+        "chunk": c["chunk_index"],
+    }
 
 
 def index_project(project_path: str) -> int:
@@ -71,49 +63,63 @@ def index_project(project_path: str) -> int:
         print("  No chunks produced.")
         return 0
 
-    # ── Phase 2: Build / rebuild the ChromaDB collection ──
+    # ── Phase 2: Open (or create) the ChromaDB collection ──
     model = get_model()
     client = _get_client(project_name)
 
     try:
-        client.delete_collection(project_name)
+        collection = client.get_collection(project_name)
+    except (chromadb.errors.InvalidDimensionException, Exception):
+        collection = client.create_collection(
+            name=project_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+    # ── Phase 3: Incremental upsert — skip unchanged chunks ──
+    # Chunk IDs are content-hash based. A missing ID means new or changed content;
+    # an existing ID means the content is identical — no secondary hash check needed.
+    existing_ids = set()
+    try:
+        existing = collection.get()
+        if existing and existing["ids"]:
+            existing_ids.update(existing["ids"])
     except Exception:
         pass
 
-    collection = client.create_collection(
-        name=project_name,
-        metadata={"hnsw:space": "cosine"},
-    )
+    upsert_chunks = [c for c in chunks if c["id"] not in existing_ids]
+    skipped = len(chunks) - len(upsert_chunks)
 
-    batch_count = math.ceil(len(chunks) / 64)
-    print(f"  {DIM}{len(files)} files → {len(chunks)} chunks → {batch_count} embedding batch(es){RESET}\n")
+    if not upsert_chunks:
+        print(f"\n  {GREEN}All {len(chunks)} chunks unchanged — nothing to do.{RESET}")
+        return 0
 
-    # ── Phase 3: Embed & store in batches ──
+    batch_count = math.ceil(len(upsert_chunks) / 64)
+    print(f"  {DIM}{len(files)} files → {len(chunks)} chunks, "
+          f"{len(upsert_chunks)} to embed, {skipped} skipped"
+          f" → {batch_count} batch(es){RESET}\n")
+
+    # ── Phase 4: Embed & store new/changed chunks ──
     BATCH = 64
     stored = 0
-    for i in range(0, len(chunks), BATCH):
-        batch = chunks[i : i + BATCH]
+    for i in range(0, len(upsert_chunks), BATCH):
+        batch = upsert_chunks[i : i + BATCH]
         texts = [c["text"] for c in batch]
 
-        # Embed
         batch_num = i // BATCH + 1
         _simple_bar(" Embedding", batch_num, batch_count)
 
         embeds = model.encode(texts, show_progress_bar=False).tolist()
 
-        # Store
         collection.add(
             ids=[c["id"] for c in batch],
             embeddings=embeds,
             documents=[c["text"] for c in batch],
-            metadatas=[
-                {"path": c["path"], "chunk": c["chunk_index"]}
-                for c in batch
-            ],
+            metadatas=[_chunk_metadata(c) for c in batch]
         )
         stored += len(batch)
 
     _simple_bar(" Embedding", batch_count, batch_count, done=True)
 
-    print(f"\n  {GREEN}{BOLD}Indexed {len(files)} files → {len(chunks)} chunks into '{project_name}'{RESET}")
+    print(f"\n  {GREEN}{BOLD}Indexed {len(files)} files → {len(chunks)} chunks into '{project_name}' "
+          f"({len(upsert_chunks)} embedded, {skipped} skipped){RESET}")
     return len(chunks)

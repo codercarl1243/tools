@@ -10,6 +10,7 @@ Falls back to sliding window whenever structural splitting
 produces chunks that are too large (>1500 chars).
 """
 
+import hashlib
 import re
 
 # Tuning knobs
@@ -20,15 +21,18 @@ MAX_CHUNK   = 1500      # if a structural chunk exceeds this, sub-split it
 
 # ── Rust ──────────────────────────────────────────────────────────────────────
 
-# Matches the start of any top-level Rust item
+# Matches the start of any top-level Rust item.
+# Handles stacked/multi-line attributes by greedily consuming consecutive
+# #[...] blocks (including those spanning multiple lines) before the keyword.
 _RS_BOUNDARY = re.compile(
-    r"(?:^|\n)"                        # start of line
-    r"(?:"
-    r"(?:#\[.*?\]\s*\n)*"             # optional attributes like #[tauri::command]
-    r"(?:pub(?:\s*\([^)]*\))?\s+)?"   # optional visibility
-    r"(?:async\s+)?"                   # optional async
+    r"(?:^|\n)"                            # start of line
+    r"(?:"                                  # group start
+    r"(?:#\[[\s\S]*?\]\s*)*"            # zero or more attribute blocks (greedy across newlines)
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?"       # optional visibility
+    r"(?:async\s+)?"                       # optional async
     r"(?:fn|impl|struct|enum|trait|type|mod|const|static|use)\b"
-    r")",
+    r")"                                   # group end
+    ,
     re.MULTILINE,
 )
 
@@ -106,10 +110,21 @@ def _flatten(sections: list[str]) -> list[str]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def chunk_id(text: str) -> str:
+    """Stable content-hash ID for a chunk (16-char hex)."""
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def chunk_file(file: dict) -> list[dict]:
     """
     Takes a file dict {path, content} and returns a list of chunk dicts:
       {id, text, path, chunk_index}
+
+    Each chunk's text is prepended with a file-context header so that
+    vector-store retrievals carry file-level context for the consuming LLM.
+
+    Chunk IDs are content-based (SHA-256) so they stay stable across
+    re-indexes unless the chunk content actually changes.
     """
     path    = file["path"]
     content = file["content"]
@@ -123,12 +138,14 @@ def chunk_file(file: dict) -> list[dict]:
         texts = _sliding_window(content)
 
     chunks = []
+    header = f"// File: {path}\n"
     for i, text in enumerate(texts):
         if not text.strip():
             continue
+        full_text = header + text.strip()
         chunks.append({
-            "id":          f"{path}::chunk{i}",
-            "text":        text,
+            "id":          chunk_id(full_text),
+            "text":        full_text,
             "path":        path,
             "chunk_index": i,
         })
