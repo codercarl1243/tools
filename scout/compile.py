@@ -12,7 +12,6 @@ import re
 import sys
 import urllib.request
 import urllib.error
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -60,31 +59,22 @@ SKIP_FILES = {
 SKIP_EXT = {".png", ".jpg", ".ico", ".woff", ".ttf", ".webp", ".lock"}
 
 def parse_repomix(xml_path: Path) -> list[dict]:
+    # Use regex-based parsing to avoid pyexpat compatibility issues
+    # (e.g. Python 3.14 on macOS has a broken libexpat linkage)
+    raw = xml_path.read_text(errors="replace")
     files = []
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        for elem in root.iter("file"):
-            path = elem.get("path", "")
-            content = (elem.text or "").strip()
-            if not content:
-                continue
-            if any(path.endswith(e) for e in SKIP_EXT):
-                continue
-            if Path(path).name in SKIP_FILES:
-                continue
-            # Truncate very large files — the LLM needs the shape, not every line
-            if len(content) > 4000:
-                content = content[:4000] + "\n... [truncated]"
-            files.append({"path": path, "content": content})
-    except ET.ParseError:
-        log("XML parse issue — falling back to regex", YELLOW)
-        raw = xml_path.read_text(errors="replace")
-        for m in re.finditer(r'<file path="([^"]+)">(.*?)</file>', raw, re.DOTALL):
-            content = m.group(2).strip()
-            if len(content) > 4000:
-                content = content[:4000] + "\n... [truncated]"
-            files.append({"path": m.group(1), "content": content})
+    for m in re.finditer(r'<file path="([^"]+)">(.*?)</file>', raw, re.DOTALL):
+        path = m.group(1)
+        content = m.group(2).strip()
+        if not content:
+            continue
+        if any(path.endswith(e) for e in SKIP_EXT):
+            continue
+        if Path(path).name in SKIP_FILES:
+            continue
+        if len(content) > 4000:
+            content = content[:4000] + "\n... [truncated]"
+        files.append({"path": path, "content": content})
     return files
 
 def chunk_files(files: list[dict], max_chars: int = 24_000) -> list[list[dict]]:
@@ -141,10 +131,10 @@ Source files:
 {files}
 """
 
-MERGE_PROMPT = """You have been given multiple partial architecture analyses of the same project "{project}",
+MERGE_PROMPT = """You have been given two partial architecture analyses of the same project "{project}",
 each covering a different subset of files.
 
-Merge them into one coherent architecture.md document with this structure:
+Merge them into one coherent architecture document with this structure:
 
 ## System Overview
 (synthesise the overviews into one clear paragraph)
@@ -157,8 +147,13 @@ Merge them into one coherent architecture.md document with this structure:
 
 ---
 
-Partial analyses to merge:
-{analyses}
+Partial analysis A:
+{analysis_a}
+
+---
+
+Partial analysis B:
+{analysis_b}
 """
 
 DEP_PROMPT = """Based on this architecture document for project "{project}", extract a JSON dependency graph.
@@ -191,6 +186,8 @@ def main():
     parser.add_argument("--output-dir",   required=True, type=Path)
     parser.add_argument("--model",        default="qwen2.5-coder:14b")
     parser.add_argument("--project-name", default="project")
+    parser.add_argument("--no-cache",     action="store_true", help="Re-run all chunks from scratch")
+    parser.add_argument("--keep-cache",   action="store_true", help="Keep .scout_cache after success")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -202,28 +199,50 @@ def main():
 
     # 2. Architecture — chunk and analyse
     chunks = chunk_files(files)
-    log(f"Processing {len(chunks)} chunk(s) through {args.model} ...")
+    log(f"Processing {len(chunks)} chunk(s) through {args.model} ..")
+
+    # Cache dir for intermediate results (so re-runs skip completed chunks)
+    cache_dir = args.output_dir / ".scout_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    use_cache = not args.no_cache
 
     analyses = []
     for i, chunk in enumerate(chunks, 1):
+        cache_file = cache_dir / f"analysis_{i:02d}.md"
+        if use_cache and cache_file.exists():
+            log(f"  Chunk {i}/{len(chunks)} — cached, skipping", GREEN)
+            analyses.append(cache_file.read_text(encoding="utf-8"))
+            continue
         log(f"  Chunk {i}/{len(chunks)} ({len(chunk)} files) ...", CYAN)
         prompt = OVERVIEW_PROMPT.format(
             project=args.project_name,
             files=format_chunk(chunk),
         )
         result = ollama(args.model, SYSTEM, prompt)
+        cache_file.write_text(result, encoding="utf-8")
         analyses.append(result)
 
-    # 3. Merge if multiple chunks
+    # 3. Merge incrementally (pairwise, two at a time) if multiple chunks
     if len(analyses) == 1:
         architecture = analyses[0]
     else:
-        log("  Merging analyses ...", CYAN)
-        merge_prompt = MERGE_PROMPT.format(
-            project=args.project_name,
-            analyses="\n\n---CHUNK BOUNDARY---\n\n".join(analyses),
-        )
-        architecture = ollama(args.model, SYSTEM, merge_prompt)
+        cache_dir = args.output_dir / ".scout_cache"
+        merged = analyses[0]
+        for i in range(1, len(analyses)):
+            merge_cache = cache_dir / f"merge_{i:02d}.md"
+            if use_cache and merge_cache.exists():
+                log(f"  Merge ({i}/{len(analyses)-1}) — cached, skipping", GREEN)
+                merged = merge_cache.read_text(encoding="utf-8")
+                continue
+            log(f"  Merging ({i}/{len(analyses)-1}) ...", CYAN)
+            merge_prompt = MERGE_PROMPT.format(
+                project=args.project_name,
+                analysis_a=merged,
+                analysis_b=analyses[i],
+            )
+            merged = ollama(args.model, SYSTEM, merge_prompt)
+            merge_cache.write_text(merged, encoding="utf-8")
+        architecture = merged
 
     # 4. Write architecture.md
     arch_path = args.output_dir / "architecture.md"
@@ -254,6 +273,14 @@ def main():
     dep_path = args.output_dir / "dependencies.json"
     dep_path.write_text(json.dumps(dep_data, indent=2), encoding="utf-8")
     log("dependencies.json written", GREEN)
+
+    # Clean up cache unless --keep-cache
+    if not args.keep_cache:
+        import shutil
+        cache_path = args.output_dir / ".scout_cache"
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+            log("Cache cleaned up", DIM)
 
 
 if __name__ == "__main__":

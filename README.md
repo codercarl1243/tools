@@ -13,7 +13,7 @@ A three-step pipeline that turns any codebase into a searchable, semantically in
 ```
 
 1. **repomix** — wraps the `repomix` npm package to produce a single XML snapshot of the entire source tree
-2. **scout** — orchestrates the pipeline: feeds the XML to a local Ollama model, which generates `architecture.md` and `dependencies.json`
+2. **scout** — chunks the XML into manageable pieces and feeds each to a local Ollama model, then pairwise-merges the results into `architecture.md` and `dependencies.json`
 3. **kb** — chunks source files at function/class boundaries, embeds them with `sentence-transformers/all-MiniLM-L6-v2`, and stores them in ChromaDB for semantic search
 
 All processing happens on your machine. Nothing leaves.
@@ -88,6 +88,18 @@ Each result includes rank, file path, chunk index, relevance score, and the sour
 
 Just run `scout` again on the same project — it deletes and rebuilds from scratch.
 
+### Resuming after a failure
+
+The compilation step caches intermediate results in `.scout_cache/` inside the output directory. If it fails mid-way (e.g., Ollama connection drops), re-running `scout` will skip already-completed chunks and pick up right where it left off. Cache is automatically cleaned up on success.
+
+```
+# Force a clean re-run (ignores cache)
+scout ~/projects/my-app --no-cache
+
+# Keep cache files for debugging
+scout ~/projects/my-app --keep-cache
+```
+
 ## Output
 
 All generated artifacts live in `~/.scout/projects/project-name/`:
@@ -155,6 +167,5 @@ See `~/.pi/agent/extensions/scout.ts` and `~/.pi/agent/skills/kb-search/` for im
 
 ## Notes
 
-- **Python version**: Make sure `python3` on your PATH points to 3.11+ (the version that has `kb`'s dependencies installed)
 - **Ollama**: The compilation step (step 2) requires Ollama running. If Ollama isn't available, scout will still generate the XML dump and index, but `architecture.md` won't be created
 - **Model choice**: Bigger models (14b+) give better architecture analysis. Smaller models (7b) are faster but less precise
