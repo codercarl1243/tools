@@ -8,11 +8,18 @@ Reads the repomix XML dump and uses a local Ollama model to generate:
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
+from typing import Optional
+
+if sys.version_info < (3, 10):
+    print(f"{RED}scout requires Python 3.10+ (found {sys.version_info.major}.{sys.version_info.minor}){RESET}")
+    sys.exit(1)
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 BOLD   = "\033[1m"
@@ -29,7 +36,7 @@ def log(msg, color=DIM):
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
-def ollama(model: str, system: str, prompt: str) -> str:
+def ollama(model: str, system: str, prompt: str, timeout: int = 300, label: str = "Ollama") -> str:
     payload = json.dumps({
         "model": model,
         "system": system,
@@ -44,10 +51,23 @@ def ollama(model: str, system: str, prompt: str) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            return json.loads(resp.read().decode()).get("response", "").strip()
-    except urllib.error.URLError:
-        print(f"\n{RED}Cannot reach Ollama. Is it running? Try: ollama serve{RESET}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode())
+            result = body.get("response", "").strip()
+            if not result:
+                print(f"\n{RED}{label} returned an empty response. Retrying once...{RESET}", flush=True)
+                with urllib.request.urlopen(req, timeout=timeout) as resp2:
+                    body2 = json.loads(resp2.read().decode())
+                    result = body2.get("response", "").strip()
+                    if not result:
+                        print(f"\n{RED}{label} returned empty response again. Check model output.{RESET}")
+                        sys.exit(1)
+            return result
+    except urllib.error.URLError as e:
+        if "timed out" in str(e).lower():
+            print(f"\n{RED}{label} timed out after {timeout}s. The prompt may be too large for this model.\nTry a larger model or use --timeout / --merge-timeout to increase the limit.{RESET}")
+        else:
+            print(f"\n{RED}Cannot reach Ollama at http://localhost:11434. Is it running? Try: ollama serve{RESET}")
         sys.exit(1)
 
 
@@ -58,7 +78,12 @@ SKIP_FILES = {
 }
 SKIP_EXT = {".png", ".jpg", ".ico", ".woff", ".ttf", ".webp", ".lock"}
 
-def parse_repomix(xml_path: Path) -> list[dict]:
+def parse_repomix(xml_path: Path, skip_ext=None, skip_files=None) -> list[dict]:
+    """Parse repomix XML dump, filtering out binary/lock files."""
+    if skip_ext is None:
+        skip_ext = SKIP_EXT
+    if skip_files is None:
+        skip_files = SKIP_FILES
     # Use regex-based parsing to avoid pyexpat compatibility issues
     # (e.g. Python 3.14 on macOS has a broken libexpat linkage)
     raw = xml_path.read_text(errors="replace")
@@ -68,26 +93,178 @@ def parse_repomix(xml_path: Path) -> list[dict]:
         content = m.group(2).strip()
         if not content:
             continue
-        if any(path.endswith(e) for e in SKIP_EXT):
+        if any(path.endswith(e) for e in skip_ext):
             continue
-        if Path(path).name in SKIP_FILES:
+        if Path(path).name in skip_files:
             continue
         if len(content) > 4000:
             content = content[:4000] + "\n... [truncated]"
         files.append({"path": path, "content": content})
     return files
 
+# Import patterns per language extension
+IMPORT_PATTERNS = {
+    # JavaScript / TypeScript
+    frozenset({".ts", ".tsx", ".js", ".jsx"}):
+        [r"from\s+['\"](.+?)['\"]" , r"require\(['\"](.+?)['\"]\)" ],
+    # Rust
+    frozenset({".rs"}):
+        [r"use\s+super::([\w]+)" , r"mod\s+([\w]+)" ],
+    # Python
+    frozenset({".py"}):
+        [r"from\s+(\S+)\s+import" , r"import\s+(\w+)" ],
+    # Go
+    frozenset({".go"}):
+        [r"import\s+[\"()](\S+)[\"]" ],
+    # C / C++ / Objective-C
+    frozenset({".c", ".h", ".cpp", ".hpp", ".cc", ".hh"}):
+        [r'#include\s+"(.+?)"'],
+}
+
+
+def _ext_key(path: str) -> frozenset:
+    """Return the IMPORT_PATTERNS key for a file's extension."""
+    ext = Path(path).suffix.lower()
+    for key in IMPORT_PATTERNS:
+        if ext in key:
+            return key
+    return None
+
+
+def _extract_refs(content: str, file_path: str) -> set:
+    """Extract module references from file content."""
+    key = _ext_key(file_path)
+    if not key:
+        return set()
+    patterns = IMPORT_PATTERNS[key]
+    refs = set()
+    for pat in patterns:
+        for m in re.finditer(pat, content):
+            refs.add(m.group(1))
+    return refs
+
+
+def _normalize(p: str) -> str:
+    """Normalize a path (collapse ../ etc) without making it absolute."""
+    return os.path.normpath(p)
+
+
+def _resolve_ref(ref: str, file_path: str, all_normalized_paths: set) -> Optional[str]:
+    """
+    Try to resolve a module reference to an actual file path.
+    Returns the matched (normalized) path or None.
+    """
+    base_dir = Path(file_path).parent
+    # Try direct match first
+    norm_ref = _normalize(ref)
+    if norm_ref in all_normalized_paths:
+        return norm_ref
+    # Try relative resolution with common extensions
+    for ext in ["", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".c", ".cpp", ".h", ".hpp"]:
+        candidate = _normalize(str(base_dir / Path(ref).with_suffix(ext)))
+        if candidate in all_normalized_paths:
+            return candidate
+    # Try index files (e.g. import './foo' -> foo/index.ts)
+    ref_path = Path(ref)
+    if not ref_path.suffix:  # no extension, might be a directory
+        for ext in [".ts", ".tsx", ".js", ".jsx", ".py", ".rs"]:
+            candidate = _normalize(str(base_dir / ref_path / f"index{ext}"))
+            if candidate in all_normalized_paths:
+                return candidate
+    return None
+
+
 def chunk_files(files: list[dict], max_chars: int = 24_000) -> list[list[dict]]:
-    chunks, current, size = [], [], 0
+    """
+    Smart chunking:
+    1. Group files by directory
+    2. Merge sibling groups that import each other
+    3. Split oversized groups using fallback size-based splitting
+    """
+    if not files:
+        return []
+
+    all_paths = {_normalize(f["path"]) for f in files}
+    path_to_file = {_normalize(f["path"]): f for f in files}
+
+    # 1. Group by directory
+    dir_groups: dict[str, list[dict]] = {}
     for f in files:
-        entry = len(f["path"]) + len(f["content"])
-        if current and size + entry > max_chars:
-            chunks.append(current)
+        dirkey = str(Path(f["path"]).parent)
+        dir_groups.setdefault(dirkey, []).append(f)
+
+    # 2. Build cross-reference edges between directories
+    dir_refs: dict[str, set[str]] = {d: set() for d in dir_groups}
+    for f in files:
+        refs = _extract_refs(f["content"], f["path"])
+        if not refs:
+            continue
+        src_dir = str(Path(f["path"]).parent)
+        for ref in refs:
+            resolved = _resolve_ref(ref, f["path"], all_paths)
+            if resolved:
+                target_dir = str(Path(resolved).parent)
+                if target_dir != src_dir:
+                    dir_refs[src_dir].add(target_dir)
+                    dir_refs[target_dir].add(src_dir)
+
+    # 3. Merge directories connected by imports (union-find)
+    parent: dict[str, str] = {d: d for d in dir_groups}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Track merged sizes to avoid creating unbounded chunks
+    group_sizes: dict[str, int] = {d: sum(len(f["path"]) + len(f["content"]) for f in files_in_dir)
+                                   for d, files_in_dir in dir_groups.items()}
+
+    for src_dir, targets in dir_refs.items():
+        for target_dir in targets:
+            if target_dir in parent:
+                root_a, root_b = find(src_dir), find(target_dir)
+                if root_a != root_b:
+                    # Only merge if combined size stays under 2x the limit
+                    combined = group_sizes[root_a] + group_sizes[root_b]
+                    if combined <= max_chars * 2:
+                        parent[root_a] = root_b
+                        group_sizes[root_b] = combined
+
+    # 4. Collect merged groups
+    merged_groups: dict[str, list[dict]] = {}
+    for d, files_in_dir in dir_groups.items():
+        root = find(d)
+        merged_groups.setdefault(root, []).extend(files_in_dir)
+
+    # 5. Sort files within each group by path (deterministic order)
+    for group in merged_groups.values():
+        group.sort(key=lambda f: f["path"])
+
+    # 6. Split oversized groups (enforced cap even after merge)
+    chunks = []
+    for group in merged_groups.values():
+        group_size = sum(len(f["path"]) + len(f["content"]) for f in group)
+        if group_size <= max_chars:
+            chunks.append(group)
+        else:
+            # Fallback to simple size-based splitting
             current, size = [], 0
-        current.append(f)
-        size += entry
-    if current:
-        chunks.append(current)
+            for f in group:
+                entry = len(f["path"]) + len(f["content"])
+                if current and size + entry > max_chars:
+                    chunks.append(current)
+                    current, size = [], 0
+                current.append(f)
+                size += entry
+            if current:
+                chunks.append(current)
     return chunks
 
 def format_chunk(files: list[dict]) -> str:
@@ -186,19 +363,30 @@ def main():
     parser.add_argument("--output-dir",   required=True, type=Path)
     parser.add_argument("--model",        default="qwen2.5-coder:14b")
     parser.add_argument("--project-name", default="project")
-    parser.add_argument("--no-cache",     action="store_true", help="Re-run all chunks from scratch")
-    parser.add_argument("--keep-cache",   action="store_true", help="Keep .scout_cache after success")
+    parser.add_argument("--timeout",          type=int, default=300, help="Timeout in seconds per chunk Ollama request (default: 300)")
+    parser.add_argument("--merge-timeout",    type=int, default=None, help="Timeout for merge/dep requests (default: 2x --timeout)")
+    parser.add_argument("--no-cache",         action="store_true", help="Re-run all chunks from scratch")
+    parser.add_argument("--keep-cache",       action="store_true", help="Keep .scout_cache after success")
+    parser.add_argument("--include-ext",      action="append", default=[], help="Override skip: include files with this extension (may be repeated)")
+    parser.add_argument("--include-file",     action="append", default=[], help="Override skip: include this filename (may be repeated)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    merge_timeout = args.merge_timeout or args.timeout * 2
 
     # 1. Parse
     log("Parsing repomix dump ...")
-    files = parse_repomix(args.repomix)
+    effective_skip_ext = SKIP_EXT - set(args.include_ext)
+    effective_skip_files = SKIP_FILES - set(args.include_file)
+    files = parse_repomix(args.repomix, skip_ext=effective_skip_ext, skip_files=effective_skip_files)
     log(f"Found {len(files)} source files", GREEN)
 
     # 2. Architecture — chunk and analyse
     chunks = chunk_files(files)
+    log(f"Processed {len(chunks)} chunk(s) from {len(files)} files")
+    for i, c in enumerate(chunks):
+        dirs = sorted(set(str(Path(f["path"]).parent) for f in c))
+        log(f"  Chunk {i+1}: {len(c)} files — {', '.join(dirs)}", DIM)
     log(f"Processing {len(chunks)} chunk(s) through {args.model} ..")
 
     # Cache dir for intermediate results (so re-runs skip completed chunks)
@@ -218,7 +406,7 @@ def main():
             project=args.project_name,
             files=format_chunk(chunk),
         )
-        result = ollama(args.model, SYSTEM, prompt)
+        result = ollama(args.model, SYSTEM, prompt, timeout=args.timeout, label=f"Chunk {i}/{len(chunks)}")
         cache_file.write_text(result, encoding="utf-8")
         analyses.append(result)
 
@@ -240,7 +428,7 @@ def main():
                 analysis_a=merged,
                 analysis_b=analyses[i],
             )
-            merged = ollama(args.model, SYSTEM, merge_prompt)
+            merged = ollama(args.model, SYSTEM, merge_prompt, timeout=merge_timeout, label=f"Merge {i}/{len(analyses)-1}")
             merge_cache.write_text(merged, encoding="utf-8")
         architecture = merged
 
@@ -251,14 +439,19 @@ def main():
     log(f"architecture.md written ({len(architecture):,} chars)", GREEN)
 
     # 5. Generate dependencies.json
+    dep_input = architecture[:10_000]
+    if len(architecture) > 10_000:
+        log(f"  Note: architecture truncated to 10,000 chars for dependency graph (original: {len(architecture):,} chars)", YELLOW)
     log("  Generating dependency graph ...", CYAN)
     dep_raw = ollama(
         args.model,
         SYSTEM,
         DEP_PROMPT.format(
             project=args.project_name,
-            architecture=architecture[:10_000],
+            architecture=dep_input,
         ),
+        timeout=merge_timeout,
+        label="Dependency graph",
     )
 
     # Strip any accidental markdown fences
@@ -276,7 +469,6 @@ def main():
 
     # Clean up cache unless --keep-cache
     if not args.keep_cache:
-        import shutil
         cache_path = args.output_dir / ".scout_cache"
         if cache_path.exists():
             shutil.rmtree(cache_path)

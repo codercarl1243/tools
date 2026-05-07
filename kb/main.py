@@ -1,7 +1,3 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import typer
 from indexer import index_project
 from query import query_project
@@ -36,7 +32,8 @@ def index(path: str = typer.Argument(..., help="Path to the project root")):
     Walks the project, skips node_modules/target/dist and lock files.
     Splits each source file into chunks at function and component boundaries,
     embeds them with a local model, and stores everything under
-    ./data/<project-name>/. Safe to re-run — rebuilds from scratch each time.
+    ./data/<project-name>/. Re-runs are incremental — only new or changed
+    files are re-embedded.
     """
     index_project(path)
 

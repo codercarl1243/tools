@@ -146,10 +146,16 @@ except Exception:
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 if [[ $# -eq 0 ]]; then
-  echo "${RED}Usage: scout <project-path> [--model <ollama-model>]${RESET}"
+  echo "${RED}Usage: scout <project-path> [options]${RESET}"
   echo ""
   echo "  scout ~/projects/my-tauri-app"
   echo "  scout ~/projects/my-tauri-app --model qwen2.5-coder:14b"
+  echo "  scout ~/projects/my-tauri-app --timeout 600 --merge-timeout 900"
+  echo ""
+  echo "  --model <name>          Ollama model (default: qwen2.5-coder:14b)"
+  echo "  --timeout <seconds>     Per-chunk Ollama timeout (default: 300)"
+  echo "  --merge-timeout <secs>  Merge/dep Ollama timeout (default: 2x --timeout)"
+  echo "  --keep-cache            Keep .scout_cache on success"
   echo ""
   exit 1
 fi
@@ -162,6 +168,9 @@ PROJECT_PATH="$(cd "$1" 2>/dev/null && pwd -P)"
 PROJECT_NAME="$(basename "$PROJECT_PATH")"
 
 MODEL="qwen2.5-coder:14b"
+TIMEOUT=""
+MERGE_TIMEOUT=""
+KEEP_CACHE=""
 
 shift
 
@@ -171,9 +180,29 @@ while [[ $# -gt 0 ]]; do
       if [[ -z "${2:-}" ]]; then
         fail "--model requires a value"
       fi
-
       MODEL="$2"
       shift 2
+      ;;
+
+    --timeout)
+      if [[ -z "${2:-}" ]]; then
+        fail "--timeout requires a value"
+      fi
+      TIMEOUT="$2"
+      shift 2
+      ;;
+
+    --merge-timeout)
+      if [[ -z "${2:-}" ]]; then
+        fail "--merge-timeout requires a value"
+      fi
+      MERGE_TIMEOUT="$2"
+      shift 2
+      ;;
+
+    --keep-cache)
+      KEEP_CACHE="--keep-cache"
+      shift
       ;;
 
     *)
@@ -259,6 +288,7 @@ node "$REPOMIX_JS" \
   --output "$REPOMIX_OUT" \
   --style xml \
   --output-show-line-numbers \
+  --ignore ".claude,.claude/**,.augment,.augment/**,.roo,.roo/**,.cline,.cline/**,.copilot,.copilot/**,.cursor,.cursor/**,.github,.github/**" \
   "$PROJECT_PATH"
 
 FILE_COUNT=$(grep -c '<file path=' "$REPOMIX_OUT" 2>/dev/null || echo "?")
@@ -303,11 +333,18 @@ echo "${DIM}  Model:   $MODEL${RESET}"
 echo "${DIM}  Reading: $REPOMIX_OUT${RESET}"
 echo ""
 
-"$PYTHON" "$COMPILE_PY" \
-  --repomix "$REPOMIX_OUT" \
-  --output-dir "$OUTPUT_DIR" \
-  --model "$MODEL" \
+COMPILE_ARGS=(
+  --repomix "$REPOMIX_OUT"
+  --output-dir "$OUTPUT_DIR"
+  --model "$MODEL"
   --project-name "$PROJECT_NAME"
+)
+
+[[ -n "$TIMEOUT" ]] && COMPILE_ARGS+=(--timeout "$TIMEOUT")
+[[ -n "$MERGE_TIMEOUT" ]] && COMPILE_ARGS+=(--merge-timeout "$MERGE_TIMEOUT")
+[[ -n "$KEEP_CACHE" ]] && COMPILE_ARGS+=($KEEP_CACHE)
+
+"$PYTHON" "$COMPILE_PY" "${COMPILE_ARGS[@]}"
 
 ARCH_LINES=$(wc -l < "$OUTPUT_DIR/architecture.md" | grep -o '[0-9]*')
 

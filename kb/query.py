@@ -1,8 +1,5 @@
-import os
 import json
-import chromadb
-from sentence_transformers import SentenceTransformer
-from indexer import get_model, _get_client
+from db import get_model, _get_client
 
 
 def query_project(
@@ -62,6 +59,6 @@ def _pretty_print(query: str, hits: list[dict]):
     print(f"\n── Results for: {query!r} ──\n")
     for h in hits:
         print(f"[{h['rank']}] {h['path']}  (chunk {h['chunk']})  score={h['score']}")
-        print("─" * 60)
+        print("-" * 60)
         print(h["text"][:500])
         print()

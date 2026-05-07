@@ -9,7 +9,7 @@ IGNORE_DIRS = {
 
 SKIP_FILES = {
     "package-lock.json", "yarn.lock", "Cargo.lock", "pnpm-lock.yaml",
-    "poetry.lock", "Gemfile.lock", "yarn.lock",
+    "poetry.lock", "Gemfile.lock",
 }
 
 # MIME types we consider "text / source code" (catches unknown extensions)
