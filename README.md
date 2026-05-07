@@ -34,13 +34,13 @@ All processing happens on your machine. Nothing leaves.
 cd ~/tools
 
 # 2. Install repomix
-cd repomix \u0026\u0026 npm install
+cd repomix npm install
 
 # 3. Install kb dependencies
-cd ../kb \u0026\u0026 pip3 install -r requirements.txt
+cd ../kb pip3 install -r requirements.txt
 
 # 4. Add scout to PATH
-cd ../scout \u0026\u0026 bash install.sh
+cd ../scout bash install.sh
 
 # 5. Reload your shell
 source ~/.bashrc   # or source ~/.zshrc
@@ -90,7 +90,7 @@ Just run `scout` again on the same project — it deletes and rebuilds from scra
 
 ## Output
 
-All generated artifacts live in `~/.scout/projects/\u003cproject-name\u003e/`:
+All generated artifacts live in `~/.scout/projects/project-name/`:
 
 | File | Description |
 |--|--|
@@ -98,7 +98,7 @@ All generated artifacts live in `~/.scout/projects/\u003cproject-name\u003e/`:
 | `dependencies.json` | Machine-readable dependency graph (nodes, edges, IPC commands) |
 | `_repomix_raw.xml` | Raw XML dump from repomix (optional — can be deleted after indexing) |
 
-The vector index itself lives in `~/tools/kb/data/\u003cproject-name\u003e/`.
+The vector index itself lives in `~/tools/kb/data/project-name/`.
 
 ## kb — Detail
 
