@@ -316,7 +316,26 @@ echo ""
 echo "${DIM}  Next: Ollama will generate architecture summaries and"
 echo "  approximate module relationships from the structural dump.${RESET}"
 
-ask_proceed "Run Knowledge Compilation?"
+# ── Skip compilation if architecture.md already exists ────────────────────────
+
+SKIP_COMPILE=false
+
+if [[ -f "$OUTPUT_DIR/architecture.md" ]]; then
+  echo ""
+  echo "${YELLOW}  architecture.md already exists for this project.${RESET}"
+  printf "${YELLOW}${BOLD}  Re-run compilation (y) or skip to indexing? [y/N] ${RESET}"
+  read -r skip_answer
+  skip_answer="${skip_answer:-n}"
+  if [[ ! "$skip_answer" =~ ^[Yy]$ ]]; then
+    SKIP_COMPILE=true
+    echo ""
+    echo "${DIM}  Skipping compilation — using existing architecture.md${RESET}"
+  fi
+else
+  ask_proceed "Run Knowledge Compilation?"
+fi
+
+if [[ "$SKIP_COMPILE" == false ]]; then
 
 # ── Model Picker ──────────────────────────────────────────────────────────────
 
@@ -373,6 +392,8 @@ print_info "Saved to:           $OUTPUT_DIR"
 echo ""
 echo "${DIM}  Next: kb will build a semantic vector index for"
 echo "  natural language search over your codebase.${RESET}"
+
+fi  # end SKIP_COMPILE block
 
 ask_proceed "Run Vector Index?"
 

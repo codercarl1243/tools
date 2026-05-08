@@ -11,7 +11,7 @@ import os
 import chromadb
 
 from utils import load_files
-from chunker import chunk_file
+from chunker import chunk_file, chunk_id
 from db import get_model, _get_client, BOLD, DIM, GREEN, YELLOW, RESET
 
 
@@ -48,9 +48,12 @@ def _chunk_metadata(c: dict, node_lookup: dict = None, file_deps: dict = None, t
         "chunk": c["chunk_index"],
     }
 
-    # Language — prefer dep graph node type, fall back to extension
+    # Language and label — prefer dep graph node, fall back to extension
     if node_lookup and path in node_lookup:
-        meta["language"] = node_lookup[path].get("type", "other")
+        node = node_lookup[path]
+        meta["language"] = node.get("type", "other")
+        if node.get("label"):
+            meta["label"] = node["label"]
     else:
         ext = os.path.splitext(path)[1].lower()
         meta["language"] = EXT_LANG_MAP.get(ext, "other")
@@ -62,6 +65,12 @@ def _chunk_metadata(c: dict, node_lookup: dict = None, file_deps: dict = None, t
     # Tag — if provided
     if tag is not None:
         meta["tag"] = tag
+
+    if c.get("is_architecture"):
+        meta["source"] = "architecture"
+    if c.get("is_ipc_meta"):
+        meta["source"] = "ipc_commands"
+        meta["language"] = "meta"
 
     return meta
 
@@ -94,6 +103,30 @@ def index_project(project_path: str, name: str = None, tag: str = None) -> int:
     for i, f in enumerate(files, 1):
         _simple_bar(" Chunking", i, total)
         chunks.extend(chunk_file(f))
+
+    # Include IPC commands as a synthetic searchable chunk
+    ipc_commands = dep_graph.get("meta", {}).get("ipc_commands", []) if os.path.exists(deps_path) else []
+    if ipc_commands:
+        ipc_text = "// File: meta/ipc_commands\nIPC Commands:\n" + "\n".join(f"- {c}" for c in ipc_commands)
+        chunks.append({
+            "id":          chunk_id(ipc_text),
+            "text":        ipc_text,
+            "path":        "meta/ipc_commands",
+            "chunk_index": 0,
+            "is_ipc_meta": True,
+        })
+        print(f"  {DIM}+ meta/ipc_commands ({len(ipc_commands)} command(s)){RESET}")
+
+    # Include architecture.md in the index if scout has generated one
+    arch_path = os.path.join(scout_dir, "architecture.md")
+    if os.path.exists(arch_path):
+        with open(arch_path, encoding="utf-8") as fh:
+            arch_content = fh.read()
+        arch_chunks = chunk_file({"path": "architecture.md", "content": arch_content})
+        for c in arch_chunks:
+            c["is_architecture"] = True
+        chunks.extend(arch_chunks)
+        print(f"  {DIM}+ architecture.md ({len(arch_chunks)} chunk(s)){RESET}")
 
     if not chunks:
         print("  No chunks produced.")

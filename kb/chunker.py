@@ -47,6 +47,29 @@ def _split_rust(content: str) -> list[str]:
     return _flatten(sections)
 
 
+# ── Python ───────────────────────────────────────────────────────────────────
+
+_PY_BOUNDARY = re.compile(
+    r"(?:^|\n)"
+    r"(?:"
+    r"(?:@\w[\w.]*(?:\([^)]*\))?\s*\n\s*)*"  # optional decorators
+    r"(?:async\s+)?"
+    r"(?:def|class)\s+\w+"
+    r")",
+    re.MULTILINE,
+)
+
+def _split_python(content: str) -> list[str]:
+    boundaries = [m.start() for m in _PY_BOUNDARY.finditer(content)]
+    if len(boundaries) < 2:
+        return _sliding_window(content)
+    sections = []
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
+        sections.append(content[start:end].strip())
+    return _flatten(sections)
+
+
 # ── TypeScript / React ────────────────────────────────────────────────────────
 
 _TS_BOUNDARY = re.compile(
@@ -134,6 +157,8 @@ def chunk_file(file: dict) -> list[dict]:
         texts = _split_rust(content)
     elif ext in ("ts", "tsx", "js", "jsx"):
         texts = _split_ts(content)
+    elif ext == "py":
+        texts = _split_python(content)
     else:
         texts = _sliding_window(content)
 
