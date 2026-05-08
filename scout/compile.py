@@ -159,9 +159,15 @@ def _resolve_ref(ref: str, file_path: str, all_normalized_paths: set) -> Optiona
     norm_ref = _normalize(ref)
     if norm_ref in all_normalized_paths:
         return norm_ref
-    # Try relative resolution with common extensions
+    # Try relative resolution by replacing the extension
     for ext in ["", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".c", ".cpp", ".h", ".hpp"]:
         candidate = _normalize(str(base_dir / Path(ref).with_suffix(ext)))
+        if candidate in all_normalized_paths:
+            return candidate
+    # Try appending extension (handles refs like './foo.type' -> 'foo.type.ts')
+    resolved_ref = str(base_dir / ref)
+    for ext in [".ts", ".tsx", ".js", ".jsx", ".py", ".rs"]:
+        candidate = _normalize(resolved_ref + ext)
         if candidate in all_normalized_paths:
             return candidate
     # Try index files (e.g. import './foo' -> foo/index.ts)
@@ -392,13 +398,18 @@ def build_dependency_graph(files: list[dict], project_name: str) -> dict:
     all_paths = {_normalize(f["path"]) for f in files}
     nodes = {}
     edges = set()  # use set for dedup, convert to list later
+    unresolved = []  # refs that couldn't be resolved (local modules only)
 
     for f in files:
         path = _normalize(f["path"])
         # Register node (first seen type wins)
         if path not in nodes:
             ext = Path(path).suffix.lower()
-            nodes[path] = {"id": path, "type": NODE_TYPE_MAP.get(ext, "other")}
+            nodes[path] = {
+                "id": path,
+                "type": NODE_TYPE_MAP.get(ext, "other"),
+                "parseable": _ext_key(path) is not None,
+            }
 
         # Resolve imports
         refs = _extract_refs(f["content"], f["path"])
@@ -407,6 +418,8 @@ def build_dependency_graph(files: list[dict], project_name: str) -> dict:
             if resolved:
                 target = _normalize(resolved)
                 edges.add((path, target))
+            elif ref.startswith(".") or ref.startswith("/"):
+                unresolved.append({"from": path, "ref": ref})
 
     dep_graph = {
         "nodes": list(nodes.values()),
@@ -417,6 +430,7 @@ def build_dependency_graph(files: list[dict], project_name: str) -> dict:
         "meta": {
             "project": project_name,
             "ipc_commands": [],
+            "unresolved_refs": unresolved,
         },
     }
     return dep_graph
