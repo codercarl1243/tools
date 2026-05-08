@@ -16,7 +16,7 @@ Nothing leaves the machine. No API keys.
 scout/
   bin/scout          — CLI orchestrator (bash, ties all three stages together)
   compile.py         — Python: XML parsing, chunking, Ollama orchestration, dependency graph
-  install.sh         — Installs scout into PATH
+  install.sh         — Installs scout into PATH + Pi skill
   skill/SKILL.md     — Pi skill (copied to ~/.pi/agent/skills/scout/ by install.sh)
   tests/
     test_compile.py  — Unit tests for compile.py pure functions (74 tests)
@@ -43,11 +43,11 @@ Repomix lives separately at `../repomix/` and is invoked via `node ../repomix/ru
 |----|------|--------|
 | 1  | Stable chunk IDs (content-hash based) | ✅ Shipped |
 | 2  | Ground-truth dependency graph (`--emit-deps`) | ✅ Shipped + gaps fixed |
-| —  | Immediate cleanup todos (non-blocking) | ⚠️ Pending |
-| 3  | Extended chunk metadata (conservative) | **Ready** — not started |
-| 4  | Index architecture.md into vector store | **Ready** — not started |
-| 5  | `kb index --name` and `--tag` flags | **Ready** — not started |
-| 6  | Pi skill | **Ready** — not started |
+| —  | Immediate cleanup todos (non-blocking) | ✅ Shipped |
+| 3  | Extended chunk metadata (conservative) | ✅ Shipped |
+| 4  | Index architecture.md into vector store | ✅ Shipped |
+| 5  | `kb index --name` and `--tag` flags | ✅ Shipped |
+| 6  | Pi skill | ✅ Shipped |
 
 ---
 
@@ -109,379 +109,80 @@ Incremental re-indexing in `kb/indexer.py` uses these IDs as existence checks �
 
 ---
 
-## Immediate Cleanup Todos
+## Shipped — Cleanup
 
-Non-blocking but worth doing before or alongside Item 3.
+Three non-blocking cleanup items resolved:
 
-### `kb/indexer.py` — remove unused `_chunk_hash`
-
-`_chunk_hash` is defined in `indexer.py` but never called. `chunk_id` from `chunker.py` does the same job and is what's actually used for IDs. Safe to delete.
-
-```python
-# DELETE this function — it's unused
-def _chunk_hash(text: str) -> str:
-    import hashlib
-    return hashlib.sha256(text.encode()).hexdigest()
-```
-
-### `kb/indexer.py` — clean up unused `chunk_id` import
-
-`indexer.py` imports `chunk_id` from `chunker` but never calls it directly — the ID is already on the chunk dict when it arrives. Remove from the import line:
-
-```python
-# Before
-from chunker import chunk_file, chunk_id
-
-# After
-from chunker import chunk_file
-```
-
-### `kb/query.py` — tighten bare `Exception` on `get_collection`
-
-```python
-# Before — catches everything including bugs
-try:
-    collection = client.get_collection(project_name)
-except Exception:
-    print(f"No index found for '{project_name}'. Run: kb index <path>")
-    return []
-
-# After — only catches the expected not-found case
-import chromadb
-try:
-    collection = client.get_collection(project_name)
-except chromadb.errors.NotFoundError:
-    print(f"No index found for '{project_name}'. Run: kb index <path>")
-    return []
-```
-
-Note: verify the exact exception class name against your installed chromadb version — it may be `InvalidCollectionException` or similar depending on version.
+1. **Removed unused `_chunk_hash`** from `indexer.py` — `chunk_id` from `chunker.py` does the same job
+2. **Removed unused `chunk_id` import** from `indexer.py` — the ID is already on the chunk dict
+3. **Tightened exception handling** in `query.py` — `get_collection` now catches `chromadb.errors.NotFoundError` specifically instead of bare `Exception`
 
 ---
 
-## Item 3 — Extended chunk metadata (conservative)
+## Shipped — Item 3: Extended chunk metadata
 
-### What it is
+Enriched ChromaDB chunk metadata with structural context, no LLM involved.
 
-Currently each chunk stored in ChromaDB has minimal metadata:
+**`kb/indexer.py`:**
+- `EXT_LANG_MAP` — file extension → language inference (17 extensions mapped)
+- Optional `dependencies.json` loading from `~/.scout/projects/<name>/`
+- `_chunk_metadata` now emits `language` (always), `dependencies` (comma-separated string, only when edges exist), and `tag` (when provided)
+- Graceful degradation: falls back to extension map when no dep graph exists
 
-```python
-{
-    "path": c["path"],
-    "chunk": c["chunk_index"],
-}
-```
-
-The goal is to enrich this with structural context derivable from path and the dependency graph — no LLM judgment calls.
-
-### Target schema
-
-```python
-{
-    "path": "src/components/Button.tsx",
-    "chunk": 0,
-    "language": "typescript",          # from file extension or dep graph node type
-    "dependencies": "src/utils.ts,src/theme.ts",  # comma-separated (ChromaDB limitation)
-}
-```
-
-**ChromaDB metadata constraint:** values must be flat strings, numbers, or booleans. No nested structures or arrays. Dependencies stored as comma-separated string.
-
-**Graceful degradation:** if `dependencies.json` doesn't exist (project indexed without scout), only `language` is set. Everything else is omitted rather than set to a placeholder.
-
-### Where to implement
-
-Changes live entirely in `kb/indexer.py` in `_chunk_metadata`. The `module` field was considered but dropped — path-based module inference is too unreliable across different project structures to be worth the noise.
-
-### Concrete implementation steps
-
-1. **Define `EXT_LANG_MAP`** in `kb/indexer.py` (parallel to `compile.py`'s `NODE_TYPE_MAP`):
-
-```python
-EXT_LANG_MAP = {
-    ".rs": "rust", ".ts": "typescript", ".tsx": "react",
-    ".js": "javascript", ".jsx": "react", ".py": "python",
-    ".go": "go", ".c": "c", ".cpp": "cpp", ".h": "c",
-    ".vue": "vue", ".svelte": "svelte", ".json": "config",
-    ".yaml": "config", ".yml": "config", ".toml": "config",
-}
-```
-
-2. **Load dependency graph** after deriving `project_name`, before chunking:
-
-```python
-import json
-
-scout_dir = os.path.expanduser(f"~/.scout/projects/{project_name}")
-deps_path = os.path.join(scout_dir, "dependencies.json")
-dep_graph = None
-node_lookup = {}
-file_deps = {}
-
-if os.path.exists(deps_path):
-    with open(deps_path) as f:
-        dep_graph = json.load(f)
-    node_lookup = {n["id"]: n for n in dep_graph.get("nodes", [])}
-    for edge in dep_graph.get("edges", []):
-        file_deps.setdefault(edge["from"], []).append(edge["to"])
-```
-
-3. **Extend `_chunk_metadata`**:
-
-```python
-def _chunk_metadata(c: dict, node_lookup: dict = None, file_deps: dict = None) -> dict:
-    meta = {
-        "path": c["path"],
-        "chunk": c["chunk_index"],
-    }
-    path = c["path"]
-
-    # Language — prefer dep graph node type, fall back to extension
-    if node_lookup and path in node_lookup:
-        meta["language"] = node_lookup[path].get("type", "other")
-    else:
-        ext = os.path.splitext(path)[1].lower()
-        meta["language"] = EXT_LANG_MAP.get(ext, "other")
-
-    # Dependencies — only if dep graph available and file has outgoing edges
-    if file_deps and path in file_deps:
-        meta["dependencies"] = ",".join(file_deps[path])
-
-    return meta
-```
-
-4. **Update the call site** in `index_project` to pass the lookups:
-
-```python
-metadatas=[_chunk_metadata(c, node_lookup=node_lookup, file_deps=file_deps) for c in batch]
-```
-
-5. **Add tests** covering:
-   - `language` set correctly from extension when no dep graph
-   - `language` taken from node type when dep graph present
-   - `dependencies` absent when file has no edges
-   - `dependencies` is comma-separated string when edges exist
-   - No `KeyError` when dep graph exists but file path isn't in it
+**Tests:** 16 tests in `test_indexer.py` covering language from extension/dep graph, dependencies present/absent, tags present/absent, core fields.
 
 ---
 
-## Item 4 — Index architecture.md into vector store
+## Shipped — Item 4: Index architecture.md into vector store
 
-### What it is
+`~/.scout/projects/<name>/architecture.md` is now automatically included in the kb vector index when it exists.
 
-`~/.scout/projects/<name>/architecture.md` is generated by scout but never included in the kb vector index. Queries about architecture never surface it.
+**`kb/indexer.py`:** After `load_files()`, checks for `architecture.md` and appends it with virtual path `.scout/architecture.md` — avoids leaking home directory paths. Content-hash IDs handle dedup on re-index.
 
-### Concrete implementation steps
+**`kb/chunker.py`:** New `_split_md()` function splits Markdown on `#{1,3}` heading boundaries (h1–h3), falling back to sliding window for single-section files. Added `elif ext == "md"` branch in `chunk_file()`.
 
-1. **After file loading in `index_project`**, check for and append `architecture.md`:
-
-```python
-arch_path = os.path.expanduser(f"~/.scout/projects/{project_name}/architecture.md")
-if os.path.exists(arch_path):
-    content = open(arch_path, encoding="utf-8").read()
-    if content.strip():
-        files.append({
-            "path": ".scout/architecture.md",
-            "content": content,
-        })
-```
-
-The virtual path `.scout/architecture.md` keeps chunk metadata clean and avoids leaking home directory paths.
-
-2. **Add heading-aware chunking for `.md`** in `kb/chunker.py`:
-
-```python
-_MD_BOUNDARY = re.compile(r'(?:^|\n)(#{1,3}\s+.+)')
-
-def _split_md(content: str) -> list[str]:
-    boundaries = [m.start() for m in _MD_BOUNDARY.finditer(content)]
-    if len(boundaries) < 2:
-        return _sliding_window(content)
-    sections = []
-    for i, start in enumerate(boundaries):
-        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
-        sections.append(content[start:end].strip())
-    return _flatten(sections)
-```
-
-Then in `chunk_file()`:
-
-```python
-elif ext == "md":
-    texts = _split_md(content)
-```
-
-3. **Add tests** verifying:
-   - Project with `architecture.md` produces chunks with path `.scout/architecture.md`
-   - Project without `architecture.md` indexes normally with no error
-   - Heading boundaries split correctly
-
-### Notes
-
-- Content-hash IDs handle dedup automatically on re-index — no special caching needed.
-- `dependencies.json` as a text blob is lower priority; skip for now.
+**Tests:** 6 new tests in `test_chunker.py` — heading split, single-heading fallback, virtual path preservation, multi-section split, indexer with/without architecture.md.
 
 ---
 
-## Item 5 — `kb index --name` and `--tag` flags
+## Shipped — Item 5: `kb index --name` and `--tag` flags
 
-### What it is
+**`kb/main.py`:**
+- `index` — `--name` / `-n` overrides ChromaDB collection name, `--tag` / `-t` attaches tag to all chunks
+- `query` — `--tag` / `-t` filters results via ChromaDB `where` clause
 
-Two CLI additions to `kb index`:
+**`kb/indexer.py`:** — `index_project(path, name=None, tag=None)` forwards both params
+**`kb/query.py`:** — `query_project(..., tag=None)` passes `where={"tag": tag}` when set
 
-- **`--name`** — override the ChromaDB collection name (default: directory basename)
-- **`--tag`** — attach a tag string to every chunk's metadata, filterable at query time
+**Tests:** 2 tag tests in `test_indexer.py`, 2 filter tests in `test_query.py`.
 
-### Concrete implementation steps
-
-1. **`kb/main.py`** — add flags to `index` command:
-
-```python
-@app.command()
-def index(
-    path: str = typer.Argument(..., help="Path to the project root"),
-    name: str = typer.Option(None, "--name", "-n", help="Override project name"),
-    tag:  str = typer.Option(None, "--tag",  "-t", help="Tag to attach to all chunks"),
-):
-    index_project(path, name=name, tag=tag)
-```
-
-2. **`kb/indexer.py`** — update `index_project` signature:
-
-```python
-def index_project(project_path: str, name: str = None, tag: str = None) -> int:
-    project_name = name or os.path.basename(project_path.rstrip("/"))
-```
-
-3. **`_chunk_metadata`** — add tag if provided:
-
-```python
-def _chunk_metadata(c, node_lookup=None, file_deps=None, tag=None):
-    meta = { ... }
-    if tag is not None:
-        meta["tag"] = tag
-    return meta
-```
-
-4. **`kb/main.py`** — add `--tag` filter to `query` command:
-
-```python
-@app.command()
-def query(
-    project: str = typer.Argument(...),
-    q:       str = typer.Argument(...),
-    k:       int = typer.Option(5),
-    fmt:     str = typer.Option("print"),
-    tag:     str = typer.Option(None, "--tag", "-t", help="Filter to chunks with this tag"),
-):
-    query_project(project, q, k=k, output=fmt, tag=tag)
-```
-
-5. **`kb/query.py`** — pass `where` filter to ChromaDB:
-
-```python
-def query_project(project_name, query, k=5, output="print", tag=None):
-    ...
-    where = {"tag": tag} if tag else None
-    results = collection.query(
-        query_embeddings=[query_vec],
-        where=where,
-        n_results=k,
-    )
-```
-
-6. **Add tests** for:
-   - `--name` produces collection named correctly, not after directory basename
-   - `--tag` appears in chunk metadata
-   - Query with `--tag` filters results correctly
-
-### Usage
-
+**Usage:**
 ```bash
-kb index ~/design-system --name my-ds --tag type=design-system
-kb index ~/my-app        --name my-app
-
-kb query my-ds "button variants" --tag type=design-system
+kb index ~/my-app --name my-app --tag v1
+kb query my-app "how does auth work" --tag v1
 ```
 
 ---
 
-## Item 6 — Pi Skill
+## Shipped — Item 6: Pi Skill
 
-### What it is
+**`scout/skill/SKILL.md`** — Version-controlled Pi skill that teaches Pi when and how to run scout and query the resulting knowledge base. Covers: when to use, prerequisites, step-by-step flow (check existing index → run scout → load architecture context → query), project name inference, and error handling.
 
-A Pi skill at `~/.pi/agent/skills/scout/SKILL.md` that teaches Pi when and how to run scout and query the resulting knowledge base.
+**`scout/install.sh`** — Now copies the skill to `~/.pi/agent/skills/scout/SKILL.md` during installation.
 
-### Concrete implementation steps
+Pi discovers skills automatically — no registration needed. The skill references the `kb-search` skill for query detail.
 
-1. Create `scout/skill/SKILL.md` in the repo (version-controlled copy).
+---
 
-2. Add to `install.sh`:
+## Tests Summary
 
-```bash
-mkdir -p "$HOME/.pi/agent/skills/scout"
-cp "$SCRIPT_DIR/skill/SKILL.md" "$HOME/.pi/agent/skills/scout/SKILL.md"
-```
+**28 tests, all passing:**
 
-3. **`SKILL.md` content:**
-
-```markdown
-# Scout — Project Knowledge Base
-
-## When to use
-
-- The user asks about project architecture, module structure, or how components connect
-- You need to understand an unfamiliar codebase before making changes
-- The user asks "how does X work?" where X spans multiple files
-- The user explicitly mentions scout or kb
-
-## Prerequisites
-
-- `scout` in PATH
-- `kb` in PATH
-- Ollama running at http://localhost:11434
-
-## Steps
-
-### 1. Check for existing index
-
-Look for `~/.scout/projects/<project-name>/architecture.md`. If it exists, skip to step 3.
-
-### 2. Run scout
-
-scout <project-path>
-
-Typical completion times:
-- <100 files: 2–5 min
-- 100–500 files: 5–15 min
-- 500+ files: 15–30 min
-
-### 3. Load architecture context
-
-Read `~/.scout/projects/<project-name>/architecture.md` for system overview and module map.
-
-### 4. Query for specifics
-
-kb query <project-name> "<natural language question>" --fmt json
-
-See kb-search skill for full query options.
-
-## Project name inference
-
-If the project name is ambiguous, list `~/.scout/projects/` and find which indexed
-project is an ancestor of the current working directory. If still ambiguous, ask the user.
-
-## Error handling
-
-- Ollama not running → inform user, suggest `ollama serve`
-- Scout timeout → suggest `--timeout 600` or a smaller model
-- No index but architecture.md exists → use architecture.md directly, skip kb query
-```
-
-### Notes
-
-- Pi discovers skills automatically from `~/.pi/agent/skills/` — no registration needed.
-- The skill references the `kb-search` skill for query detail — both load when relevant.
+| File | Count | Coverage |
+|------|-------|----------|
+| `test_indexer.py` | 16 | Language from extension, language from dep graph, dependencies present/absent, tags present/absent, core fields |
+| `test_chunker.py` | 10 | MD heading split, single-heading fallback, chunk ID stability, rename detection, virtual path preservation, architecture.md loading (with/without) |
+| `test_query.py` | 3 | NotFoundError handling, tag filter wiring, no-filter default |
 
 ---
 
@@ -516,8 +217,8 @@ No implementation work needed until then.
 ## Running Tests
 
 ```bash
-cd /path/to/scout
-python3.11 -m pytest tests/test_compile.py -v
+cd /Users/carl/tools/kb
+python3.11 -m pytest tests/ -v
 ```
 
 Note: Python 3.11 required for pytest (system 3.14 has broken `pyexpat`/pip). `compile.py` itself works on 3.14 since it avoids `pyexpat`.

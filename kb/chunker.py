@@ -77,6 +77,22 @@ def _split_ts(content: str) -> list[str]:
     return _flatten(sections)
 
 
+# ── Markdown ──────────────────────────────────────────────────────────────
+
+_MD_BOUNDARY = re.compile(r'(?:^|\n)(#{1,3}\s+.+)')
+
+def _split_md(content: str) -> list[str]:
+    """Split Markdown on heading boundaries (h1–h3), fall back to sliding window."""
+    boundaries = [m.start() for m in _MD_BOUNDARY.finditer(content)]
+    if len(boundaries) < 2:
+        return _sliding_window(content)
+    sections = []
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(content)
+        sections.append(content[start:end].strip())
+    return _flatten(sections)
+
+
 # ── Sliding window (fallback) ─────────────────────────────────────────────────
 
 def _sliding_window(content: str, size: int = WINDOW_SIZE, overlap: int = OVERLAP) -> list[str]:
@@ -134,6 +150,8 @@ def chunk_file(file: dict) -> list[dict]:
         texts = _split_rust(content)
     elif ext in ("ts", "tsx", "js", "jsx"):
         texts = _split_ts(content)
+    elif ext == "md":
+        texts = _split_md(content)
     else:
         texts = _sliding_window(content)
 

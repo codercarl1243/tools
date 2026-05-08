@@ -88,6 +88,16 @@ def index_project(project_path: str, name: str = None, tag: str = None) -> int:
         print("  No indexable files found.")
         return 0
 
+    # ── Append architecture.md if available ──
+    arch_path = os.path.expanduser(f"~/.scout/projects/{project_name}/architecture.md")
+    if os.path.exists(arch_path):
+        content = open(arch_path, encoding="utf-8").read()
+        if content.strip():
+            files.append({
+                "path": ".scout/architecture.md",
+                "content": content,
+            })
+
     print(f"\n  {DIM}Chunking files...{RESET}")
     chunks = []
     total = len(files)

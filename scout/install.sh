@@ -25,6 +25,11 @@ chmod +x "$INSTALL_DIR/scout"
 
 echo "${GREEN}✓${RESET} Installed to $INSTALL_DIR/scout"
 
+# ── Install Pi skill ──────
+mkdir -p "$HOME/.pi/agent/skills/scout"
+cp "$SCRIPT_DIR/skill/SKILL.md" "$HOME/.pi/agent/skills/scout/SKILL.md"
+echo "${GREEN}✓${RESET} Installed Pi skill to ~/.pi/agent/skills/scout/SKILL.md"
+
 # Detect shell config file
 if [[ "$SHELL" == *"/zsh" ]]; then
   SHELL_RC="$HOME/.zshrc"
