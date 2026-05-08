@@ -48,6 +48,7 @@ def query_project(
             "path":  meta["path"],
             "chunk": meta["chunk"],
             "score": round(1 - dist, 4),   # cosine similarity, higher = better
+            "label": meta.get("label"),
             "text":  doc,
         })
 
@@ -62,7 +63,8 @@ def query_project(
 def _pretty_print(query: str, hits: list[dict]):
     print(f"\n── Results for: {query!r} ──\n")
     for h in hits:
-        print(f"[{h['rank']}] {h['path']}  (chunk {h['chunk']})  score={h['score']}")
+        label_str = f"\n     {h['label']}" if h.get("label") else ""
+        print(f"[{h['rank']}] {h['path']}  (chunk {h['chunk']})  score={h['score']}{label_str}")
         print("-" * 60)
         print(h["text"][:500])
         print()

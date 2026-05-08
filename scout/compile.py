@@ -17,10 +17,6 @@ import urllib.error
 from pathlib import Path
 from typing import Optional
 
-if sys.version_info < (3, 10):
-    print(f"{RED}scout requires Python 3.10+ (found {sys.version_info.major}.{sys.version_info.minor}){RESET}")
-    sys.exit(1)
-
 # ── Colours ───────────────────────────────────────────────────────────────────
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
@@ -29,6 +25,10 @@ CYAN   = "\033[36m"
 YELLOW = "\033[33m"
 RED    = "\033[31m"
 RESET  = "\033[0m"
+
+if sys.version_info < (3, 10):
+    print(f"{RED}scout requires Python 3.10+ (found {sys.version_info.major}.{sys.version_info.minor}){RESET}")
+    sys.exit(1)
 
 def log(msg, color=DIM):
     print(f"  {color}{msg}{RESET}", flush=True)
@@ -101,6 +101,38 @@ def parse_repomix(xml_path: Path, skip_ext=None, skip_files=None) -> list[dict]:
             content = content[:4000] + "\n... [truncated]"
         files.append({"path": path, "content": content})
     return files
+
+# IPC / route command patterns per language extension
+IPC_PATTERNS = {
+    frozenset({".rs"}): [
+        r"#\[tauri::command\][\s\S]{0,100}?fn\s+(\w+)",
+    ],
+    frozenset({".ts", ".tsx", ".js", ".jsx"}): [
+        r"ipcMain\.(?:handle|on)\(['\"]([^'\"]+)['\"]",
+        r"(?:app|router)\.(?:get|post|put|patch|delete)\(['\"]([^'\"]+)['\"]",
+        r"(?:socket|io)\.on\(['\"]([^'\"]+)['\"]",
+    ],
+    frozenset({".py"}): [
+        r"@(?:app|router)\.(?:get|post|put|patch|delete)\(['\"]([^'\"]+)['\"]",
+    ],
+}
+
+
+def extract_ipc_commands(files: list[dict]) -> list[str]:
+    """Extract IPC command and route names from source files via regex."""
+    found = set()
+    for f in files:
+        ext = Path(f["path"]).suffix.lower()
+        for key, patterns in IPC_PATTERNS.items():
+            if ext in key:
+                for pat in patterns:
+                    for m in re.finditer(pat, f["content"], re.DOTALL):
+                        name = m.group(1).strip()
+                        if name:
+                            found.add(name)
+                break
+    return sorted(found)
+
 
 # Import patterns per language extension
 IMPORT_PATTERNS = {
@@ -339,7 +371,7 @@ Partial analysis B:
 {analysis_b}
 """
 
-DEP_PROMPT = """Based on this architecture document for project "{project}", extract a JSON dependency graph.
+_DEP_PROMPT_BASE = """Based on this architecture document for project "{project}", extract a JSON dependency graph.
 
 Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
 
@@ -355,10 +387,21 @@ Return ONLY valid JSON — no markdown fences, no explanation, nothing else.
     "ipc_commands": ["command_name_1", "command_name_2"]
   }}
 }}
-
+{ipc_anchor}
 Architecture document:
 {architecture}
 """
+
+_IPC_ANCHOR = """
+The following IPC commands/routes were detected directly from source — use these exactly \
+as the ipc_commands list. Do not add or remove any:
+{commands}
+"""
+
+
+def build_dep_prompt(project: str, architecture: str, static_ipc: list[str]) -> str:
+    anchor = _IPC_ANCHOR.format(commands="\n".join(f"- {c}" for c in static_ipc)) if static_ipc else ""
+    return _DEP_PROMPT_BASE.format(project=project, architecture=architecture, ipc_anchor=anchor)
 
 
 # Node type labels by extension
@@ -450,7 +493,7 @@ def main():
     parser.add_argument("--keep-cache",       action="store_true", help="Keep .scout_cache after success")
     parser.add_argument("--include-ext",      action="append", default=[], help="Override skip: include files with this extension (may be repeated)")
     parser.add_argument("--include-file",     action="append", default=[], help="Override skip: include this filename (may be repeated)")
-    parser.add_argument("--emit-deps",      action="store_true", help="Generate dependencies.json from source import resolution instead of LLM")
+    parser.add_argument("--llm-deps",        action="store_true", help="Generate dependencies.json using LLM instead of source import resolution (slower, less reliable)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -521,9 +564,14 @@ def main():
     log(f"architecture.md written ({len(architecture):,} chars)", GREEN)
 
     # 5. Generate dependencies.json
-    if args.emit_deps:
+    static_ipc = extract_ipc_commands(files)
+    if static_ipc:
+        log(f"  Detected {len(static_ipc)} IPC command(s): {', '.join(static_ipc)}", GREEN)
+
+    if not args.llm_deps:
         log("  Building dependency graph from source ...", CYAN)
         dep_data = build_dependency_graph(files, args.project_name)
+        dep_data["meta"]["ipc_commands"] = static_ipc
     else:
         dep_input = architecture[:10_000]
         if len(architecture) > 10_000:
@@ -532,10 +580,7 @@ def main():
         dep_raw = ollama(
             args.model,
             SYSTEM,
-            DEP_PROMPT.format(
-                project=args.project_name,
-                architecture=dep_input,
-            ),
+            build_dep_prompt(args.project_name, dep_input, static_ipc),
             timeout=merge_timeout,
             label="Dependency graph",
         )

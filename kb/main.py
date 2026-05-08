@@ -1,66 +1,83 @@
-import typer
+import argparse
+import os
+import sys
 from indexer import index_project
 from query import query_project
-
-app = typer.Typer(
-    help=(
-        "kb — local code knowledge base\n\n"
-        "Indexes your source code into a local vector database so you can search it "
-        "with natural language queries.\n\n"
-        "How it works:\n\n"
-        "  1. 'kb index' walks your project, splits every source file into focused "
-        "chunks (by function/component boundaries for .rs and .ts/.tsx, sliding window "
-        "for everything else), embeds each chunk using a local code-search model, and "
-        "stores the result in ./data/<project-name>/.\n\n"
-        "  2. 'kb query' embeds your question the same way, finds the most similar "
-        "chunks by cosine similarity, and returns the actual source snippets ranked by relevance.\n\n"
-        "Nothing leaves your machine. No API keys. The model and index live in ~/.cache "
-        "and ./data/ respectively.\n\n"
-        "Quick start:\n\n"
-        "  kb index ~/projects/my-tauri-app\n\n"
-        "  kb query my-tauri-app \"how do tauri commands connect to the frontend\""
-    ),
-    no_args_is_help=True,
-)
+from db import _get_client
 
 
-@app.command()
-def index(
-    path: str = typer.Argument(..., help="Path to the project root"),
-    name: str = typer.Option(None, "--name", "-n", help="Override project name"),
-    tag:  str = typer.Option(None, "--tag",  "-t", help="Tag to attach to all chunks"),
-):
-    """
-    Index a project into the local vector store.
-
-    Walks the project, skips node_modules/target/dist and lock files.
-    Splits each source file into chunks at function and component boundaries,
-    embeds them with a local model, and stores everything under
-    ./data/<project-name>/. Re-runs are incremental — only new or changed
-    files are re-embedded.
-    """
-    index_project(path, name=name, tag=tag)
+def cmd_index(args):
+    index_project(args.path, name=args.name, tag=args.tag)
 
 
-@app.command()
-def query(
-    project: str = typer.Argument(..., help="Project name (basename of the indexed path)"),
-    q: str       = typer.Argument(..., help="Natural language query"),
-    k: int       = typer.Option(5,     help="Number of results to return"),
-    fmt: str     = typer.Option("print", help="Output format: print | json"),
-    tag:     str = typer.Option(None, "--tag", "-t", help="Filter to chunks with this tag"),
-):
-    """
-    Search the index for a project.
+def cmd_query(args):
+    query_project(args.project, args.q, k=args.k, output=args.fmt, tag=args.tag)
 
-    Finds the most relevant source chunks for your question and prints them
-    ranked by similarity score. Use --fmt json to get structured output
-    suitable for piping into an LLM.
 
-    Example: kb query my-tauri-app "how is the auth token stored" --k 8
-    """
-    query_project(project, q, k=k, output=fmt, tag=tag)
+def cmd_list(args):
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(module_dir, "data")
+
+    if not os.path.exists(data_dir):
+        print("No projects indexed yet.")
+        return
+
+    projects = sorted(p for p in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, p)))
+    if not projects:
+        print("No projects indexed yet.")
+        return
+
+    print(f"\n  {'Project':<30} {'Chunks':>8}  Scout artifacts")
+    print(f"  {'─'*30} {'─'*8}  {'─'*16}")
+    for name in projects:
+        try:
+            client = _get_client(name)
+            collection = client.get_collection(name)
+            count = collection.count()
+        except Exception:
+            count = "?"
+
+        scout_dir = os.path.expanduser(f"~/.scout/projects/{name}")
+        artifacts = []
+        if os.path.exists(os.path.join(scout_dir, "architecture.md")):
+            artifacts.append("architecture.md")
+        if os.path.exists(os.path.join(scout_dir, "dependencies.json")):
+            artifacts.append("deps.json")
+
+        print(f"  {name:<30} {str(count):>8}  {', '.join(artifacts) or '–'}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="kb",
+        description="kb — local code knowledge base",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_index = sub.add_parser("index", help="Index a project into the local vector store")
+    p_index.add_argument("path", help="Path to the project root")
+    p_index.add_argument("--name", "-n", default=None, help="Override project name")
+    p_index.add_argument("--tag",  "-t", default=None, help="Tag to attach to all chunks")
+
+    p_query = sub.add_parser("query", help="Search the index for a project")
+    p_query.add_argument("project", help="Project name (basename of the indexed path)")
+    p_query.add_argument("q",       help="Natural language query")
+    p_query.add_argument("--k",   type=int, default=5,  help="Number of results to return")
+    p_query.add_argument("--fmt", default="print",       help="Output format: print | json")
+    p_query.add_argument("--tag", "-t", default=None,   help="Filter to chunks with this tag")
+
+    sub.add_parser("list", help="List all indexed projects with chunk counts and scout artifacts")
+
+    args = parser.parse_args()
+
+    if args.command == "index":
+        cmd_index(args)
+    elif args.command == "query":
+        cmd_query(args)
+    elif args.command == "list":
+        cmd_list(args)
 
 
 if __name__ == "__main__":
-    app()
+    main()
