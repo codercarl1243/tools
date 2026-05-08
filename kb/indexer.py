@@ -10,7 +10,7 @@ import os
 import chromadb
 
 from utils import load_files
-from chunker import chunk_file, chunk_id
+from chunker import chunk_file
 from db import get_model, _get_client, BOLD, DIM, GREEN, YELLOW, RESET
 
 
@@ -26,12 +26,6 @@ def _simple_bar(label: str, current: int, total: int, done: bool = False, width:
     print(f"\r  {label}  {bar} {pct}  ({current}/{total})  {flag}", flush=True, end="")
     if done:
         print()
-
-
-def _chunk_hash(text: str) -> str:
-    """Full 32-char hex hash for metadata. Chunk IDs are already 16-char hashes."""
-    import hashlib
-    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _chunk_metadata(c: dict) -> dict:

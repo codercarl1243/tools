@@ -1,4 +1,5 @@
 import json
+import chromadb.errors
 from db import get_model, _get_client
 
 
@@ -23,7 +24,7 @@ def query_project(
 
     try:
         collection = client.get_collection(project_name)
-    except Exception:
+    except chromadb.errors.NotFoundError:
         print(f"No index found for '{project_name}'. Run: kb index <path>")
         return []
 
