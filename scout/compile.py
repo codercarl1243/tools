@@ -355,6 +355,73 @@ Architecture document:
 """
 
 
+# Node type labels by extension
+NODE_TYPE_MAP = {
+    ".rs": "rust",
+    ".ts": "typescript",
+    ".tsx": "react",
+    ".js": "javascript",
+    ".jsx": "react",
+    ".py": "python",
+    ".go": "go",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".hpp": "cpp",
+    ".h": "c",
+    ".vue": "vue",
+    ".svelte": "svelte",
+    ".css": "stylesheet",
+    ".scss": "stylesheet",
+    ".html": "html",
+    ".json": "config",
+    ".yaml": "config",
+    ".yml": "config",
+    ".toml": "config",
+}
+
+
+def build_dependency_graph(files: list[dict], project_name: str) -> dict:
+    """Build a ground-truth dependency graph from import resolution.
+
+    Runs _extract_refs / _resolve_ref over every file and produces a
+    deterministic edge list. No LLM involved — structural only.
+
+    Returns a dict in the same schema as the LLM-generated dependencies.json:
+      {nodes, edges, meta}
+    """
+    all_paths = {_normalize(f["path"]) for f in files}
+    nodes = {}
+    edges = set()  # use set for dedup, convert to list later
+
+    for f in files:
+        path = _normalize(f["path"])
+        # Register node (first seen type wins)
+        if path not in nodes:
+            ext = Path(path).suffix.lower()
+            nodes[path] = {"id": path, "type": NODE_TYPE_MAP.get(ext, "other")}
+
+        # Resolve imports
+        refs = _extract_refs(f["content"], f["path"])
+        for ref in refs:
+            resolved = _resolve_ref(ref, f["path"], all_paths)
+            if resolved:
+                target = _normalize(resolved)
+                edges.add((path, target))
+
+    dep_graph = {
+        "nodes": list(nodes.values()),
+        "edges": [
+            {"from": src, "to": dst, "kind": "imports"}
+            for src, dst in sorted(edges)
+        ],
+        "meta": {
+            "project": project_name,
+            "ipc_commands": [],
+        },
+    }
+    return dep_graph
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -369,6 +436,7 @@ def main():
     parser.add_argument("--keep-cache",       action="store_true", help="Keep .scout_cache after success")
     parser.add_argument("--include-ext",      action="append", default=[], help="Override skip: include files with this extension (may be repeated)")
     parser.add_argument("--include-file",     action="append", default=[], help="Override skip: include this filename (may be repeated)")
+    parser.add_argument("--emit-deps",      action="store_true", help="Generate dependencies.json from source import resolution instead of LLM")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -439,33 +507,39 @@ def main():
     log(f"architecture.md written ({len(architecture):,} chars)", GREEN)
 
     # 5. Generate dependencies.json
-    dep_input = architecture[:10_000]
-    if len(architecture) > 10_000:
-        log(f"  Note: architecture truncated to 10,000 chars for dependency graph (original: {len(architecture):,} chars)", YELLOW)
-    log("  Generating dependency graph ...", CYAN)
-    dep_raw = ollama(
-        args.model,
-        SYSTEM,
-        DEP_PROMPT.format(
-            project=args.project_name,
-            architecture=dep_input,
-        ),
-        timeout=merge_timeout,
-        label="Dependency graph",
-    )
+    if args.emit_deps:
+        log("  Building dependency graph from source ...", CYAN)
+        dep_data = build_dependency_graph(files, args.project_name)
+    else:
+        dep_input = architecture[:10_000]
+        if len(architecture) > 10_000:
+            log(f"  Note: architecture truncated to 10,000 chars for dependency graph (original: {len(architecture):,} chars)", YELLOW)
+        log("  Generating dependency graph ...", CYAN)
+        dep_raw = ollama(
+            args.model,
+            SYSTEM,
+            DEP_PROMPT.format(
+                project=args.project_name,
+                architecture=dep_input,
+            ),
+            timeout=merge_timeout,
+            label="Dependency graph",
+        )
 
-    # Strip any accidental markdown fences
-    dep_clean = re.sub(r"```(?:json)?\n?", "", dep_raw).strip().rstrip("`").strip()
+        # Strip any accidental markdown fences
+        dep_clean = re.sub(r"```(?:json)?\n?", "", dep_raw).strip().rstrip("`").strip()
 
-    try:
-        dep_data = json.loads(dep_clean)
-    except json.JSONDecodeError:
-        log("Could not parse dependency JSON — saving raw output", YELLOW)
-        dep_data = {"raw": dep_raw, "parse_error": True}
+        try:
+            dep_data = json.loads(dep_clean)
+        except json.JSONDecodeError:
+            log("Could not parse dependency JSON — saving raw output", YELLOW)
+            dep_data = {"raw": dep_raw, "parse_error": True}
 
     dep_path = args.output_dir / "dependencies.json"
     dep_path.write_text(json.dumps(dep_data, indent=2), encoding="utf-8")
-    log("dependencies.json written", GREEN)
+    edge_count = len(dep_data.get("edges", []))
+    node_count = len(dep_data.get("nodes", []))
+    log(f"dependencies.json written ({node_count} nodes, {edge_count} edges)", GREEN)
 
     # Clean up cache unless --keep-cache
     if not args.keep_cache:
