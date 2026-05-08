@@ -25,7 +25,11 @@ app = typer.Typer(
 
 
 @app.command()
-def index(path: str = typer.Argument(..., help="Path to the project root")):
+def index(
+    path: str = typer.Argument(..., help="Path to the project root"),
+    name: str = typer.Option(None, "--name", "-n", help="Override project name"),
+    tag:  str = typer.Option(None, "--tag",  "-t", help="Tag to attach to all chunks"),
+):
     """
     Index a project into the local vector store.
 
@@ -35,7 +39,7 @@ def index(path: str = typer.Argument(..., help="Path to the project root")):
     ./data/<project-name>/. Re-runs are incremental — only new or changed
     files are re-embedded.
     """
-    index_project(path)
+    index_project(path, name=name, tag=tag)
 
 
 @app.command()
@@ -44,6 +48,7 @@ def query(
     q: str       = typer.Argument(..., help="Natural language query"),
     k: int       = typer.Option(5,     help="Number of results to return"),
     fmt: str     = typer.Option("print", help="Output format: print | json"),
+    tag:     str = typer.Option(None, "--tag", "-t", help="Filter to chunks with this tag"),
 ):
     """
     Search the index for a project.
@@ -54,7 +59,7 @@ def query(
 
     Example: kb query my-tauri-app "how is the auth token stored" --k 8
     """
-    query_project(project, q, k=k, output=fmt)
+    query_project(project, q, k=k, output=fmt, tag=tag)
 
 
 if __name__ == "__main__":

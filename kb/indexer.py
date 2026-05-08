@@ -5,6 +5,7 @@ Supports incremental re-indexing: chunk IDs are content-hash based
 re-embedded on subsequent runs.
 """
 
+import json
 import math
 import os
 import chromadb
@@ -28,16 +29,57 @@ def _simple_bar(label: str, current: int, total: int, done: bool = False, width:
         print()
 
 
-def _chunk_metadata(c: dict) -> dict:
+# ── Extension → language map ──
+
+EXT_LANG_MAP = {
+    ".rs": "rust", ".ts": "typescript", ".tsx": "react",
+    ".js": "javascript", ".jsx": "react", ".py": "python",
+    ".go": "go", ".c": "c", ".cpp": "cpp", ".h": "c",
+    ".vue": "vue", ".svelte": "svelte", ".json": "config",
+    ".yaml": "config", ".yml": "config", ".toml": "config",
+}
+
+
+def _chunk_metadata(c: dict, node_lookup: dict = None, file_deps: dict = None, tag: str = None) -> dict:
     """Build ChromaDB metadata dict for a chunk."""
-    return {
-        "path": c["path"],
+    path = c["path"]
+    meta = {
+        "path": path,
         "chunk": c["chunk_index"],
     }
 
+    # Language — prefer dep graph node type, fall back to extension
+    if node_lookup and path in node_lookup:
+        meta["language"] = node_lookup[path].get("type", "other")
+    else:
+        ext = os.path.splitext(path)[1].lower()
+        meta["language"] = EXT_LANG_MAP.get(ext, "other")
 
-def index_project(project_path: str) -> int:
-    project_name = os.path.basename(project_path.rstrip("/"))
+    # Dependencies — only if dep graph available and file has outgoing edges
+    if file_deps and path in file_deps:
+        meta["dependencies"] = ",".join(file_deps[path])
+
+    # Tag — if provided
+    if tag is not None:
+        meta["tag"] = tag
+
+    return meta
+
+
+def index_project(project_path: str, name: str = None, tag: str = None) -> int:
+    project_name = name or os.path.basename(project_path.rstrip("/"))
+
+    # ── Load dependency graph (optional, from scout) ──
+    node_lookup = {}
+    file_deps = {}
+    scout_dir = os.path.expanduser(f"~/.scout/projects/{project_name}")
+    deps_path = os.path.join(scout_dir, "dependencies.json")
+    if os.path.exists(deps_path):
+        with open(deps_path) as f:
+            dep_graph = json.load(f)
+        node_lookup = {n["id"]: n for n in dep_graph.get("nodes", [])}
+        for edge in dep_graph.get("edges", []):
+            file_deps.setdefault(edge["from"], []).append(edge["to"])
 
     # ── Phase 1: Load & chunk files ──
     print(f"\n  {BOLD}Loading files from {project_path}...{RESET}")
@@ -108,7 +150,7 @@ def index_project(project_path: str) -> int:
             ids=[c["id"] for c in batch],
             embeddings=embeds,
             documents=[c["text"] for c in batch],
-            metadatas=[_chunk_metadata(c) for c in batch]
+            metadatas=[_chunk_metadata(c, node_lookup=node_lookup, file_deps=file_deps, tag=tag) for c in batch]
         )
         stored += len(batch)
 

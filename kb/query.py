@@ -8,6 +8,7 @@ def query_project(
     query: str,
     k: int = 5,
     output: str = "print",   # "print" | "json" | "raw"
+    tag: str = None,
 ) -> list[dict]:
     """
     Search the index for a project.
@@ -29,8 +30,10 @@ def query_project(
         return []
 
     query_vec = model.encode([query])[0].tolist()
+    where = {"tag": tag} if tag else None
     results   = collection.query(
         query_embeddings=[query_vec],
+        where=where,
         n_results=k,
     )
 
