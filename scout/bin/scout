@@ -212,13 +212,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Output ────────────────────────────────────────────────────────────────────
-# NOTE:
-# Keeping this outside the repo avoids:
-# - git pollution
-# - giant XML files in projects
-# - stale generated artifacts
+# Artifacts live inside the project under .scout/ so they can be committed:
+#   .scout/architecture.md     ← commit this
+#   .scout/dependencies.json   ← commit this
+#   .scout/_repomix_raw.xml    ← gitignored (large, temporary)
+#   .scout/data/               ← gitignored (binary vector index)
 
-OUTPUT_DIR="$HOME/.scout/projects/$PROJECT_NAME"
+OUTPUT_DIR="$PROJECT_PATH/.scout"
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
@@ -238,6 +238,21 @@ if ! curl --max-time 3 -sf http://localhost:11434/api/tags >/dev/null; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+# ── Gitignore ─────────────────────────────────────────────────────────────────
+# Exclude binary/large artifacts from git; leave markdown + JSON committable.
+
+GITIGNORE="$PROJECT_PATH/.gitignore"
+_ensure_gitignored() {
+  local pattern="$1"
+  if [[ -f "$GITIGNORE" ]]; then
+    grep -qxF "$pattern" "$GITIGNORE" || echo "$pattern" >> "$GITIGNORE"
+  else
+    echo "$pattern" >> "$GITIGNORE"
+  fi
+}
+_ensure_gitignored ".scout/data/"
+_ensure_gitignored ".scout/_repomix_raw.xml"
 
 # ── Introduction ──────────────────────────────────────────────────────────────
 

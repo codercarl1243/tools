@@ -79,9 +79,13 @@ def index_project(project_path: str, name: str = None, tag: str = None) -> int:
     project_name = name or os.path.basename(project_path.rstrip("/"))
 
     # ── Load dependency graph (optional, from scout) ──
+    # Look in <project>/.scout/ first (co-located, committable),
+    # fall back to ~/.scout/projects/<name>/ for older setups.
     node_lookup = {}
     file_deps = {}
-    scout_dir = os.path.expanduser(f"~/.scout/projects/{project_name}")
+    _local_scout  = os.path.join(project_path, ".scout")
+    _central_scout = os.path.expanduser(f"~/.scout/projects/{project_name}")
+    scout_dir = _local_scout if os.path.isdir(_local_scout) else _central_scout
     deps_path = os.path.join(scout_dir, "dependencies.json")
     if os.path.exists(deps_path):
         with open(deps_path) as f:
@@ -98,7 +102,7 @@ def index_project(project_path: str, name: str = None, tag: str = None) -> int:
         return 0
 
     # ── Append architecture.md if available ──
-    arch_path = os.path.expanduser(f"~/.scout/projects/{project_name}/architecture.md")
+    arch_path = os.path.join(scout_dir, "architecture.md")
     if os.path.exists(arch_path):
         content = open(arch_path, encoding="utf-8").read()
         if content.strip():
